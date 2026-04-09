@@ -1,0 +1,22 @@
+# Secrets — NEVER commit
+.anthropic_api_key
+.gmail_app_password
+*.key
+*.env
+
+# Generated data files
+*.xlsx
+~$*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor / IDE
+.claude/
+.vscode/
+.idea/
+.DS_Store
