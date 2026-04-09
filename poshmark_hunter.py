@@ -52,7 +52,8 @@ from openpyxl.utils import get_column_letter
 EMAIL_ADDRESS = "efeld248@gmail.com"
 MIN_RATING_FOR_EMAIL = 4    # Only email listings rated >= this
 MAX_POSHMARK_PAGES = 2      # Max category pages per brand/category/size
-RATING_BATCH_SIZE = 15      # Listings rated per Claude API call
+RATING_BATCH_SIZE = 20      # Listings rated per Claude API call
+RATING_PACE_SECONDS = 3.2   # Min seconds between rater API calls (self-throttle)
 CLAUDE_MODEL = "claude-haiku-4-5"
 
 OUTPUT_DIR = Path(os.environ.get(
@@ -78,6 +79,16 @@ WATCH_BRANDS = [
     "Hamilton",
 ]
 
+# Trash brands to drop on sight in unfiltered verticals
+BRAND_BLACKLIST = {
+    "stafford", "van heusen", "arrow", "chaps", "claiborne", "kirkland",
+    "dockers", "haggar", "perry ellis", "izod", "alfani", "kenneth cole",
+    "calvin klein", "nautica", "tommy hilfiger", "michael kors", "apt. 9",
+    "apt 9", "croft & barrow", "jos. a. bank", "jos a bank", "merona",
+    "george", "geoffrey beene", "marc anthony", "sean john", "ecko",
+    "joseph abboud", "pronto uomo",
+}
+
 # Category → search config
 # slug   = Poshmark category URL slug
 # sizes  = size filter values ([""] for none)
@@ -88,22 +99,33 @@ CATEGORY_CONFIG = {
         "slug": "Men-Suits-Blazers",
         "sizes": ["42R"],
         "brands": MENSWEAR_BRANDS,
+        "target_sizes": {"jacket": "42R"},
     },
     "Dress Shirt": {
         "slug": "Men-Dress-Shirts",
         "sizes": ["15.5", "15 1/2"],
         "brands": MENSWEAR_BRANDS,
+        "target_sizes": {"collar": "15.5"},
     },
     "Dress Pants": {
         "slug": "Men-Dress-Pants",
         "sizes": ["32"],
         "brands": MENSWEAR_BRANDS,
+        "target_sizes": {"waist": 32, "inseam": 29},
     },
     "Watch": {
         "slug": "Men-Accessories-Watches",
         "sizes": [""],
         "brands": WATCH_BRANDS,
         "max_price": 1000,
+        "target_sizes": None,
+    },
+    # New vertical: full suits (no brand filter), scored on fit match
+    "Suit (Full)": {
+        "slug": "Men-Suits-Blazers",
+        "sizes": ["42R"],
+        "brands": [""],  # empty string = skip brand filter
+        "target_sizes": {"jacket": "42R", "pants": "32Wx29L"},
     },
 }
 
@@ -255,16 +277,18 @@ def _normalise_detail(raw: dict, category: str, fallback_brand: str) -> dict | N
 def _fetch_category_ids(brand: str, category: str, slug: str,
                         size: str, page: int, max_price: int | None) -> list[str]:
     """Fetch a single category-page result set and return listing IDs."""
-    url = (
-        f"https://poshmark.com/category/{slug}"
-        f"?brand%5B%5D={requests.utils.quote(brand)}"
-    )
+    params = []
+    if brand:
+        params.append(f"brand%5B%5D={requests.utils.quote(brand)}")
     if size:
-        url += f"&size%5B%5D={requests.utils.quote(size)}"
+        params.append(f"size%5B%5D={requests.utils.quote(size)}")
     if max_price:
-        url += f"&max_price={max_price}"
+        params.append(f"max_price={max_price}")
     if page > 1:
-        url += f"&max_id={page}"
+        params.append(f"max_id={page}")
+    url = f"https://poshmark.com/category/{slug}"
+    if params:
+        url += "?" + "&".join(params)
 
     try:
         resp = _SESSION.get(url, timeout=15)
@@ -282,15 +306,18 @@ def gather_listings() -> list[dict]:
     """
     # 1. Build the (brand, category, slug, size, page, max_price) task list
     tasks = []
+    category_targets: dict[str, dict | None] = {}
     for cat_label, cfg in CATEGORY_CONFIG.items():
         max_price = cfg.get("max_price")
+        category_targets[cat_label] = cfg.get("target_sizes")
         for brand in cfg["brands"]:
             for size in cfg["sizes"]:
                 for page in range(1, MAX_POSHMARK_PAGES + 1):
                     tasks.append((brand, cat_label, cfg["slug"], size, page, max_price))
 
     # 2. Parallel category page fetches
-    seen: dict[str, tuple[str, str]] = {}  # lid → (brand, category)
+    # lid → (brand, category, target_sizes)
+    seen: dict[str, tuple[str, str, dict | None]] = {}
     log.info(f"Fetching {len(tasks)} category pages in parallel...")
     with ThreadPoolExecutor(max_workers=12) as ex:
         futures = {
@@ -304,7 +331,7 @@ def gather_listings() -> list[dict]:
                 continue
             for lid in ids:
                 if lid not in seen:
-                    seen[lid] = (brand, cat_label)
+                    seen[lid] = (brand, cat_label, category_targets.get(cat_label))
     log.info(f"  Found {len(seen)} unique listing IDs")
 
     # 3. Parallel listing detail fetches
@@ -320,12 +347,61 @@ def gather_listings() -> list[dict]:
                 continue
             if not raw:
                 continue
-            brand, cat_label = seen[lid]
+            brand, cat_label, targets = seen[lid]
             norm = _normalise_detail(raw, cat_label, brand)
             if norm:
+                norm["target_sizes"] = targets
                 listings.append(norm)
     log.info(f"  Got {len(listings)} normalised listings")
     return listings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PRE-FILTER (drop obvious noise before spending API tokens)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SUIT_FULL_NEG = re.compile(
+    r"\b(blazer only|jacket only|sport coat|sportcoat|top only)\b", re.I)
+_SUIT_FULL_POS = re.compile(r"\bsuit(s|ing)?\b", re.I)
+
+
+def _prefilter_listings(listings: list[dict]) -> list[dict]:
+    """
+    Apply cheap heuristic filters to drop obvious noise before rating.
+    Returns the kept listings; logs a per-category count.
+    """
+    kept: list[dict] = []
+    dropped_by_cat: dict[str, int] = {}
+
+    for L in listings:
+        cat = L.get("category", "")
+        brand = (L.get("brand") or "").strip().lower()
+        title = (L.get("title") or "")
+        reason = None
+
+        # Universal brand blacklist
+        if brand in BRAND_BLACKLIST:
+            reason = "blacklisted brand"
+
+        # Suit (Full) vertical: must mention "suit" in title and not be an
+        # explicit blazer/jacket-only listing
+        elif cat == "Suit (Full)":
+            if not _SUIT_FULL_POS.search(title):
+                reason = "no 'suit' in title"
+            elif _SUIT_FULL_NEG.search(title):
+                reason = "explicit blazer/jacket-only"
+
+        if reason:
+            dropped_by_cat[cat] = dropped_by_cat.get(cat, 0) + 1
+            continue
+        kept.append(L)
+
+    total_dropped = sum(dropped_by_cat.values())
+    log.info(f"Pre-filter: kept {len(kept)} / {len(listings)} "
+             f"(dropped {total_dropped})")
+    for cat, n in sorted(dropped_by_cat.items()):
+        log.info(f"  dropped {n} from {cat}")
+    return kept
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -368,8 +444,30 @@ reference number, complications) add credibility and quality.
 Again: DO NOT factor price into your rating. A $30 item and a $3000 item should be \
 rated identically if they are the same intrinsic quality.
 
+In addition to the quality rating, for each listing also return:
+
+  - "fit": 1-5 integer rating of how well this listing matches the buyer's target \
+sizes (provided per listing). 5 = exact match across all target dimensions; 4 = \
+matches primary dimension with minor gap on secondary; 3 = close enough to alter \
+(e.g. waist matches, inseam 1-2" off); 2 = noticeable mismatch; 1 = wrong size. \
+If no target_sizes are provided, return fit=0.
+
+  - "sizing": one of "Complete", "Partial", or "Missing":
+      * "Complete" = listing specifies ALL sizing dimensions relevant to the target \
+(e.g. for a full suit: both jacket size AND pants waist/inseam; for a shirt: collar \
+size; for pants: waist AND inseam).
+      * "Partial" = some but not all dimensions specified.
+      * "Missing" = no usable size info, or "see photos" dodge.
+    If no target_sizes are provided, return sizing="Complete".
+
+For the "reason" field:
+  - If rating >= 3: one short phrase (max 10 words) describing what makes the item \
+notable or unremarkable.
+  - If rating <= 2: return reason as an empty string "". No explanation needed for \
+rejects.
+
 Respond ONLY with a JSON array, one object per listing, in the same order received:
-[{"id": "...", "rating": N, "reason": "one short sentence about the item's quality"}]
+[{"id": "...", "rating": N, "reason": "...", "fit": N, "sizing": "Complete|Partial|Missing"}]
 No prose, no markdown, no code fences."""
 
 
@@ -395,13 +493,30 @@ def _build_rater_payload(batch: list[dict]) -> str:
             "title": L.get("title", "")[:120],
             "condition": L.get("condition", ""),
             "size": L.get("size_raw", ""),
+            "target_sizes": L.get("target_sizes"),
             "description": L.get("description", "")[:400],
         })
     return json.dumps(items, separators=(",", ":"))
 
 
+def _extract_text(resp) -> str:
+    """Pull text out of an Anthropic response, tolerating various block shapes."""
+    try:
+        for block in resp.content:
+            # Object-style SDK block
+            txt = getattr(block, "text", None)
+            if txt:
+                return txt
+            # Dict-style block (rare, but seen in error paths)
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text", "")
+    except Exception:
+        pass
+    return ""
+
+
 def _rate_batch(client: anthropic.Anthropic, batch: list[dict]) -> dict[str, dict]:
-    """Send one batch of listings to Claude. Returns {id: {rating, reason}}."""
+    """Send one batch of listings to Claude. Returns {id: {rating, reason, fit, sizing}}."""
     payload = _build_rater_payload(batch)
     try:
         resp = client.messages.create(
@@ -410,18 +525,24 @@ def _rate_batch(client: anthropic.Anthropic, batch: list[dict]) -> dict[str, dic
             system=_RATING_SYSTEM,
             messages=[{"role": "user", "content": payload}],
         )
-        text = resp.content[0].text.strip()
+        text = _extract_text(resp).strip()
+        if not text:
+            return {}
         # Strip code fences if model added them anyway
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         results = json.loads(text)
         return {
-            r["id"]: {"rating": int(r.get("rating", 0)),
-                      "reason": str(r.get("reason", ""))}
+            r["id"]: {
+                "rating": int(r.get("rating", 0)),
+                "reason": str(r.get("reason", "")),
+                "fit": int(r.get("fit", 0) or 0),
+                "sizing": str(r.get("sizing", "")),
+            }
             for r in results if isinstance(r, dict) and "id" in r
         }
     except Exception as e:
-        log.warning(f"  Rating batch failed: {e}")
+        log.warning(f"  Rating batch failed: {type(e).__name__}: {str(e)[:120]}")
         return {}
 
 
@@ -442,24 +563,31 @@ def rate_listings(listings: list[dict]) -> list[dict]:
     batches = [listings[i:i + RATING_BATCH_SIZE]
                for i in range(0, len(listings), RATING_BATCH_SIZE)]
 
-    log.info(f"Rating {len(listings)} listings via Claude in {len(batches)} batches...")
+    log.info(f"Rating {len(listings)} listings via Claude in {len(batches)} batches "
+             f"(paced {RATING_PACE_SECONDS}s apart, ETA ~{len(batches)*RATING_PACE_SECONDS/60:.1f}m)...")
 
-    # Parallelize the API calls
+    # Sequential self-throttled rater: keeps us under 10K tok/min cap without 429s
     all_ratings: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures = [ex.submit(_rate_batch, client, b) for b in batches]
-        for fut in as_completed(futures):
-            all_ratings.update(fut.result())
+    t_last = 0.0
+    for i, b in enumerate(batches, 1):
+        elapsed = time.time() - t_last
+        if elapsed < RATING_PACE_SECONDS:
+            time.sleep(RATING_PACE_SECONDS - elapsed)
+        t_last = time.time()
+        all_ratings.update(_rate_batch(client, b))
+        if i % 10 == 0 or i == len(batches):
+            log.info(f"  Batch {i}/{len(batches)}  ({len(all_ratings)} rated)")
 
     log.info(f"  First pass: {len(all_ratings)} / {len(listings)} rated")
 
-    # Retry pass for any stragglers (rate-limit failures, etc.)
+    # Retry pass for any stragglers
     missing = [L for L in listings if L["id"] not in all_ratings]
     if missing:
-        log.info(f"  Retrying {len(missing)} unrated listings (sequential)...")
+        log.info(f"  Retrying {len(missing)} unrated listings...")
         retry_batches = [missing[i:i + RATING_BATCH_SIZE]
                          for i in range(0, len(missing), RATING_BATCH_SIZE)]
         for b in retry_batches:
+            time.sleep(RATING_PACE_SECONDS)
             all_ratings.update(_rate_batch(client, b))
         log.info(f"  After retry: {len(all_ratings)} / {len(listings)} rated")
 
@@ -467,6 +595,8 @@ def rate_listings(listings: list[dict]) -> list[dict]:
         r = all_ratings.get(L["id"], {})
         L["rating"] = r.get("rating")
         L["rating_reason"] = r.get("reason", "")
+        L["fit"] = r.get("fit") or None
+        L["sizing"] = r.get("sizing", "")
     return listings
 
 
@@ -476,6 +606,8 @@ def rate_listings(listings: list[dict]) -> list[dict]:
 
 _COL_SPEC: list[tuple[str, int]] = [
     ("Rating",          8),
+    ("Fit",             7),
+    ("Sizing",         11),
     ("Brand",          18),
     ("Category",       16),
     ("Title",          42),
@@ -558,8 +690,11 @@ def build_excel(deals: list[dict], output_path: Path) -> Path:
             flags.append("NWT")
         flags_str = ", ".join(flags)
 
+        fit_val = deal.get("fit")
         row_vals = [
             rating,
+            fit_val if fit_val else "",
+            deal.get("sizing", ""),
             deal.get("brand", ""),
             deal.get("category", ""),
             deal.get("title", ""),
@@ -583,9 +718,18 @@ def build_excel(deals: list[dict], output_path: Path) -> Path:
             col_name = _COL_SPEC[ci - 1][0]
             if col_name == "Price":
                 cell.number_format = '"$"#,##0.00'
-            elif col_name == "Rating":
+            elif col_name in ("Rating", "Fit"):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(name="Arial", size=12, bold=True)
+            elif col_name == "Sizing":
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                sv = str(val).lower()
+                if sv == "complete":
+                    cell.fill = PatternFill("solid", start_color="C6EFCE")
+                elif sv == "partial":
+                    cell.fill = PatternFill("solid", start_color="FFEB9C")
+                elif sv == "missing":
+                    cell.fill = PatternFill("solid", start_color="FFC7CE")
 
     n_data = len(sorted_deals)
 
@@ -602,8 +746,8 @@ def build_excel(deals: list[dict], output_path: Path) -> Path:
         ("Rated 4 (strong)",      f"=COUNTIF(Deals!A3:A{n_data+2},4)"),
         ("Rated 3 (fair)",        f"=COUNTIF(Deals!A3:A{n_data+2},3)"),
         ("Rated 1-2 (skip)",      f"=COUNTIF(Deals!A3:A{n_data+2},\"<=2\")"),
-        ("Avg price",             f"=IFERROR(AVERAGE(Deals!G3:G{n_data+2}),\"\")"),
-        ("Just listed (≤3 days)", f"=COUNTIF(Deals!J3:J{n_data+2},\"*NEW*\")"),
+        ("Avg price",             f"=IFERROR(AVERAGE(Deals!I3:I{n_data+2}),\"\")"),
+        ("Just listed (≤3 days)", f"=COUNTIF(Deals!L3:L{n_data+2},\"*NEW*\")"),
     ]
     for ri, (label, val) in enumerate(summary_rows, start=1):
         lc = ws2.cell(row=ri, column=1, value=label)
@@ -738,7 +882,22 @@ def main() -> Path:
         log.warning("No listings found.")
         return OUTPUT_DIR / "empty.xlsx"
 
+    # Pre-filter: drop obvious noise before spending API tokens
+    listings = _prefilter_listings(listings)
+
     rated = rate_listings(listings)
+
+    # Post-filter: Suit (Full) vertical requires Complete sizing info
+    # (rater determines whether both jacket AND pant measurements are specified)
+    before = len(rated)
+    rated = [
+        L for L in rated
+        if L.get("category") != "Suit (Full)"
+        or str(L.get("sizing", "")).lower() == "complete"
+    ]
+    dropped = before - len(rated)
+    if dropped:
+        log.info(f"Post-filter: dropped {dropped} Suit (Full) listings with incomplete sizing")
 
     log.info(f"Total listings: {len(rated)}")
     if rated:
